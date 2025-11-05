@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MCP Agent Demo</title>
+    {% csrf_token %}
+  </head>
+  <body>
+    <div id="app" data-page="{{ page|escapejs }}"></div>
+    <script id="page-data" type="application/json">{{ page|safe }}</script>
+    <!-- Load built frontend assets -->
+    <script type="module" src="/static/frontend/assets/main.js"></script>
+  </body>
+</html>
+
+

@@ -1,0 +1,64 @@
+services:
+  frontend-build:
+    image: node:20-alpine
+    working_dir: /app/frontend
+    command: sh -c "rm -rf node_modules/.cache && npm ci && npm run build"
+    volumes:
+      - ./:/app
+      - frontend-node-modules:/app/frontend/node_modules
+    environment:
+      - CI=1
+
+  # GitHub MCP Server as a separate service (optional - can use docker run instead)
+  github-mcp:
+    image: ghcr.io/github/github-mcp-server:latest
+    environment:
+      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_ACCESS_TOKEN}
+    stdin_open: true
+    tty: true
+    profiles:
+      - github-mcp-service  # Only start if explicitly requested
+
+  backend:
+    image: python:3.12-slim
+    working_dir: /app/backend
+    command: >
+      sh -c "
+      apt-get update -qq &&
+      apt-get install -y -qq curl ca-certificates gnupg lsb-release &&
+      install -m 0755 -d /etc/apt/keyrings &&
+      curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg &&
+      chmod a+r /etc/apt/keyrings/docker.gpg &&
+      ARCH=\$$(dpkg --print-architecture) &&
+      CODENAME=\$$(lsb_release -cs) &&
+      echo \"deb [arch=\$$ARCH signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \$$CODENAME stable\" > /etc/apt/sources.list.d/docker.list &&
+      apt-get update -qq &&
+      apt-get install -y -qq docker-ce-cli &&
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash - &&
+      apt-get install -y -qq nodejs &&
+      pip install -r requirements.txt &&
+      python manage.py migrate &&
+      python manage.py runserver 0.0.0.0:8000
+      "
+    environment:
+      - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PERSONAL_ACCESS_TOKEN}
+      - NOTION_TOKEN=${NOTION_TOKEN}
+    ports:
+      - "8000:8000"
+      - "9553:9553"  # OAuth callback port for Notion MCP server
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - backend-pip-cache:/root/.cache/pip
+      - git-repo-cache:/tmp/git-repos
+      # Mount Docker socket for Docker-in-Docker (GitHub MCP server)
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - frontend-build
+
+volumes:
+  frontend-node-modules:
+  backend-pip-cache:
+  git-repo-cache:
+
