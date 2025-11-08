@@ -24,6 +24,55 @@ class MCPHarness:
     def __init__(self, notion_cmd: str | None = None, git_cmd: str | None = None):
         self.notion_cmd = notion_cmd or settings.NOTION_MCP_CMD
         self.git_cmd = git_cmd or settings.GIT_MCP_CMD
+    
+    def _is_user_repo(self, item: Dict[str, Any], username: str) -> bool:
+        """
+        Check if a GitHub item belongs to the authenticated user's repository.
+        Returns True if item is from user's repo, False otherwise.
+        """
+        if not username:
+            return True  # If no username, don't filter
+        
+        # Check various possible fields for repository ownership
+        repo_full_name = None
+        repo_owner = None
+        
+        # Try to extract repo information from different response formats
+        if "repository" in item:
+            repo = item["repository"]
+            if isinstance(repo, dict):
+                repo_full_name = repo.get("full_name", "")
+                repo_owner = repo.get("owner", {})
+                if isinstance(repo_owner, dict):
+                    repo_owner = repo_owner.get("login", "")
+        elif "repo" in item:
+            repo_full_name = item["repo"]
+        elif "full_name" in item:
+            repo_full_name = item["full_name"]
+        
+        # Also check path-based extraction (e.g., "owner/repo/path/to/file")
+        if not repo_full_name and "path" in item:
+            path = item["path"]
+            # Path might be in format "owner/repo/path" or just "path"
+            if "/" in path:
+                parts = path.split("/")
+                if len(parts) >= 2:
+                    potential_owner = parts[0]
+                    if potential_owner.lower() == username.lower():
+                        return True
+        
+        # Check if owner matches authenticated user
+        if repo_full_name:
+            owner = repo_full_name.split("/")[0] if "/" in repo_full_name else None
+            if owner and owner.lower() == username.lower():
+                return True
+        
+        if repo_owner and isinstance(repo_owner, str) and repo_owner.lower() == username.lower():
+            return True
+        
+        # If we can't determine ownership, be conservative and exclude it
+        logger.debug(f"Could not determine repo ownership for item: {item.get('path', item.get('name', 'unknown'))}")
+        return False
 
     async def notion_list(self) -> List[Dict[str, Any]]:
         if not self.notion_cmd or not MCP_AVAILABLE:
@@ -312,19 +361,22 @@ class MCPHarness:
                                         logger.info(f"Skipping search_code for commit count query - need list_commits")
                                         continue
                                     
-                                    # Always scope search to authenticated user's repositories
+                                    # Always scope search to authenticated user's repositories ONLY
                                     keywords = [w for w in query.lower().split() if w not in ["what", "implementation", "exists", "about", "the", "a", "an", "commit", "committed", "my", "my"]]
                                     if username:
+                                        # Use user: qualifier to restrict to user's repos only
+                                        # Also add repo: qualifier if we can determine specific repo from query
                                         search_query = f"user:{username}"
                                         if keywords:
                                             search_query += f" {' '.join(keywords)}"
                                         params = {"query": search_query}
-                                        logger.info(f"Scoping code search to user {username}'s repositories: {search_query}")
+                                        logger.info(f"Scoping code search to user {username}'s repositories ONLY: {search_query}")
                                     elif keywords:
                                         params = {"query": " ".join(keywords)}
-                                        logger.info(f"Searching code for keywords: {keywords}")
+                                        logger.info(f"Searching code for keywords: {keywords} (WARNING: Not scoped to user)")
                                     else:
                                         params = {"query": query}
+                                        logger.warning(f"Searching code without user scope - may return results from other repos")
                                 elif tool_name == "search_repositories":
                                     # Always search user's repos first when username is available
                                     if username:
@@ -374,7 +426,8 @@ class MCPHarness:
                                             except Exception as e:
                                                 logger.debug(f"Could not get user info: {e}")
                                         
-                                        # Step 2: Search for user's repositories
+                                        # Step 2: Get repositories the token actually has access to
+                                        # For fine-grained tokens, we need to verify access by trying to read from each repo
                                         if username and "search_repositories" in tool_names:
                                             try:
                                                 repo_result = await session.call_tool("search_repositories", {"query": f"user:{username}"})
@@ -383,10 +436,108 @@ class MCPHarness:
                                                     try:
                                                         repo_data = json.loads(repo_text) if isinstance(repo_text, str) else repo_text
                                                         if isinstance(repo_data, dict) and "items" in repo_data:
-                                                            repos_found = repo_data["items"][:10]  # Get more repos for "my" queries
+                                                            all_repos = repo_data["items"][:20]  # Get more repos to check
                                                         elif isinstance(repo_data, list):
-                                                            repos_found = repo_data[:10]
-                                                        logger.info(f"Found {len(repos_found)} repos for user {username}")
+                                                            all_repos = repo_data[:20]
+                                                        else:
+                                                            all_repos = []
+                                                        
+                                                        # Verify token access by trying to read from each repository
+                                                        # Fine-grained tokens only have access to specified repos
+                                                        repos_found = []
+                                                        logger.info(f"Verifying token access for {len(all_repos)} repositories...")
+                                                        
+                                                        for repo in all_repos:
+                                                            repo_full_name = repo.get("full_name", "")
+                                                            repo_name = repo.get("name", "")
+                                                            repo_owner = None
+                                                            if isinstance(repo.get("owner"), dict):
+                                                                repo_owner = repo.get("owner", {}).get("login", "")
+                                                            elif repo.get("owner"):
+                                                                repo_owner = str(repo.get("owner"))
+                                                            
+                                                            if not repo_owner:
+                                                                # Extract from full_name
+                                                                if repo_full_name and "/" in repo_full_name:
+                                                                    repo_owner = repo_full_name.split("/")[0]
+                                                                else:
+                                                                    repo_owner = username
+                                                            
+                                                            # Verify token access - use stricter check for fine-grained tokens
+                                                            # Public repos allow reading commits without auth, so we need a different approach
+                                                            repo_is_private = repo.get("private", False)
+                                                            
+                                                            if repo_owner and repo_name:
+                                                                has_access = False
+                                                                
+                                                                # For private repos, try list_commits (requires explicit access)
+                                                                # For public repos, try get_file_contents or list_branches (more restrictive)
+                                                                if repo_is_private and "list_commits" in tool_names:
+                                                                    try:
+                                                                        await session.call_tool("list_commits", {
+                                                                            "owner": repo_owner,
+                                                                            "repo": repo_name,
+                                                                            "per_page": 1
+                                                                        })
+                                                                        has_access = True
+                                                                        logger.debug(f"Token verified access to private repo {repo_full_name or f'{repo_owner}/{repo_name}'}")
+                                                                    except Exception as e:
+                                                                        logger.debug(f"Token does NOT have access to private repo {repo_full_name or f'{repo_owner}/{repo_name}'}: {e}")
+                                                                        continue
+                                                                elif not repo_is_private:
+                                                                    # For public repos, try get_file_contents which requires explicit repo access
+                                                                    # Even public repos require token access for get_file_contents if token is fine-grained
+                                                                    if "get_file_contents" in tool_names:
+                                                                        try:
+                                                                            # Try to read a common file (README, .gitignore, etc.)
+                                                                            await session.call_tool("get_file_contents", {
+                                                                                "owner": repo_owner,
+                                                                                "repo": repo_name,
+                                                                                "path": "README.md"
+                                                                            })
+                                                                            has_access = True
+                                                                            logger.debug(f"Token verified access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'} via get_file_contents")
+                                                                        except Exception as e:
+                                                                            # If README.md doesn't exist, try .gitignore
+                                                                            try:
+                                                                                await session.call_tool("get_file_contents", {
+                                                                                    "owner": repo_owner,
+                                                                                    "repo": repo_name,
+                                                                                    "path": ".gitignore"
+                                                                                })
+                                                                                has_access = True
+                                                                                logger.debug(f"Token verified access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'} via .gitignore")
+                                                                            except Exception as e2:
+                                                                                logger.debug(f"Token does NOT have access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'}: {e2}")
+                                                                                continue
+                                                                    elif "list_branches" in tool_names:
+                                                                        # Fallback: try list_branches (also requires explicit access for fine-grained tokens)
+                                                                        try:
+                                                                            await session.call_tool("list_branches", {
+                                                                                "owner": repo_owner,
+                                                                                "repo": repo_name
+                                                                            })
+                                                                            has_access = True
+                                                                            logger.debug(f"Token verified access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'} via list_branches")
+                                                                        except Exception as e:
+                                                                            logger.debug(f"Token does NOT have access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'}: {e}")
+                                                                            continue
+                                                                    else:
+                                                                        # Can't verify properly, skip this repo to be safe
+                                                                        logger.warning(f"Cannot verify access to {repo_full_name or f'{repo_owner}/{repo_name}'} - no suitable tools available")
+                                                                        continue
+                                                                
+                                                                if has_access:
+                                                                    repos_found.append(repo)
+                                                            else:
+                                                                # Can't determine owner/repo, skip it
+                                                                logger.debug(f"Cannot verify access - missing owner or repo name")
+                                                                continue
+                                                        
+                                                        if repos_found:
+                                                            logger.info(f"Token has access to {len(repos_found)} repository/repositories: {[r.get('full_name', r.get('name', 'unknown')) for r in repos_found]}")
+                                                        else:
+                                                            logger.warning(f"Token does not have access to any of the {len(all_repos)} repositories found")
                                                     except Exception as e:
                                                         logger.debug(f"Error parsing repo data: {e}")
                                             except Exception as e:
@@ -401,7 +552,15 @@ class MCPHarness:
                                             # For "how many commits" queries, count commits from all repos
                                             is_count_query = any(word in query_lower for word in ["how many", "count", "number of"])
                                             
-                                            repos_to_check = repos_found[:10] if is_count_query else repos_found[:3]  # Check more repos for count queries
+                                            # For "my repo" (singular) queries, only check the first repo or filtered repo
+                                            is_singular_repo_query = any(phrase in query_lower for phrase in ["my repo", "my repository", "name of my", "what is my repo"])
+                                            
+                                            # If repo filter is set or query is singular, only check first repo
+                                            if settings.GITHUB_REPO_FILTER or is_singular_repo_query:
+                                                repos_to_check = repos_found[:1]
+                                                logger.info(f"Query is singular or repo filter is set - checking only first repo: {repos_to_check[0].get('name', 'unknown') if repos_to_check else 'none'}")
+                                            else:
+                                                repos_to_check = repos_found[:10] if is_count_query else repos_found[:3]  # Check more repos for count queries
                                             logger.info(f"Checking {len(repos_to_check)} repos for commits: {[r.get('name', 'unknown') for r in repos_to_check]}")
                                             
                                             if not repos_to_check:
@@ -601,17 +760,125 @@ class MCPHarness:
                                                 try:
                                                     parsed = json.loads(content.text)
                                                     logger.debug(f"Parsed JSON item: {type(parsed)}")
+                                                    
+                                                    # For search_repositories, verify token access to each repo
+                                                    # Fine-grained tokens only have access to specified repos
+                                                    if tool_name == "search_repositories" and isinstance(parsed, (list, dict)):
+                                                        repos_to_verify = parsed if isinstance(parsed, list) else [parsed]
+                                                        verified_repos = []
+                                                        
+                                                        for repo in repos_to_verify:
+                                                            repo_full_name = repo.get("full_name", "")
+                                                            repo_name = repo.get("name", "")
+                                                            repo_owner = None
+                                                            if isinstance(repo.get("owner"), dict):
+                                                                repo_owner = repo.get("owner", {}).get("login", "")
+                                                            elif repo.get("owner"):
+                                                                repo_owner = str(repo.get("owner"))
+                                                            
+                                                            if not repo_owner and repo_full_name and "/" in repo_full_name:
+                                                                repo_owner = repo_full_name.split("/")[0]
+                                                            
+                                                            # Verify token access - use stricter check for fine-grained tokens
+                                                            repo_is_private = repo.get("private", False)
+                                                            
+                                                            if repo_owner and repo_name:
+                                                                has_access = False
+                                                                
+                                                                # For private repos, try list_commits (requires explicit access)
+                                                                # For public repos, try get_file_contents (more restrictive, requires explicit token access)
+                                                                if repo_is_private and "list_commits" in tool_names:
+                                                                    try:
+                                                                        await session.call_tool("list_commits", {
+                                                                            "owner": repo_owner,
+                                                                            "repo": repo_name,
+                                                                            "per_page": 1
+                                                                        })
+                                                                        has_access = True
+                                                                        logger.debug(f"Token verified access to private repo {repo_full_name or f'{repo_owner}/{repo_name}'}")
+                                                                    except Exception as e:
+                                                                        logger.debug(f"Token does NOT have access to private repo {repo_full_name or f'{repo_owner}/{repo_name}'}: {e}")
+                                                                        continue
+                                                                elif not repo_is_private:
+                                                                    # For public repos, use get_file_contents which requires explicit repo access
+                                                                    if "get_file_contents" in tool_names:
+                                                                        try:
+                                                                            await session.call_tool("get_file_contents", {
+                                                                                "owner": repo_owner,
+                                                                                "repo": repo_name,
+                                                                                "path": "README.md"
+                                                                            })
+                                                                            has_access = True
+                                                                            logger.debug(f"Token verified access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'}")
+                                                                        except Exception as e:
+                                                                            try:
+                                                                                await session.call_tool("get_file_contents", {
+                                                                                    "owner": repo_owner,
+                                                                                    "repo": repo_name,
+                                                                                    "path": ".gitignore"
+                                                                                })
+                                                                                has_access = True
+                                                                                logger.debug(f"Token verified access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'}")
+                                                                            except Exception as e2:
+                                                                                logger.debug(f"Token does NOT have access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'}: {e2}")
+                                                                                continue
+                                                                    elif "list_branches" in tool_names:
+                                                                        try:
+                                                                            await session.call_tool("list_branches", {
+                                                                                "owner": repo_owner,
+                                                                                "repo": repo_name
+                                                                            })
+                                                                            has_access = True
+                                                                            logger.debug(f"Token verified access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'}")
+                                                                        except Exception as e:
+                                                                            logger.debug(f"Token does NOT have access to public repo {repo_full_name or f'{repo_owner}/{repo_name}'}: {e}")
+                                                                            continue
+                                                                    else:
+                                                                        logger.warning(f"Cannot verify access to {repo_full_name or f'{repo_owner}/{repo_name}'} - no suitable tools")
+                                                                        continue
+                                                                
+                                                                if has_access:
+                                                                    verified_repos.append(repo)
+                                                            else:
+                                                                logger.debug(f"Cannot verify access - missing owner or repo name")
+                                                                continue
+                                                        
+                                                        if verified_repos:
+                                                            if isinstance(parsed, list):
+                                                                items.extend(verified_repos)
+                                                            else:
+                                                                items.append(verified_repos[0])
+                                                            logger.info(f"Verified token access to {len(verified_repos)} repository/repositories: {[r.get('full_name', r.get('name', 'unknown')) for r in verified_repos]}")
+                                                        continue
+                                                    
+                                                    # Filter results to only include items from authenticated user's repositories
                                                     if isinstance(parsed, list):
-                                                        items.extend(parsed)
+                                                        filtered = []
+                                                        for item in parsed:
+                                                            # Check if item belongs to authenticated user's repo
+                                                            if username and self._is_user_repo(item, username):
+                                                                filtered.append(item)
+                                                            elif not username:
+                                                                # If no username, include all (but log warning)
+                                                                filtered.append(item)
+                                                        items.extend(filtered)
+                                                        if len(filtered) < len(parsed):
+                                                            logger.info(f"Filtered {len(parsed) - len(filtered)} items not from user {username}'s repositories")
                                                     elif isinstance(parsed, dict):
-                                                        items.append(parsed)
+                                                        # Check if single item belongs to user's repo
+                                                        if username and self._is_user_repo(parsed, username):
+                                                            items.append(parsed)
+                                                        elif not username:
+                                                            items.append(parsed)
+                                                        else:
+                                                            logger.debug(f"Filtered out item not from user {username}'s repository")
                                                 except json.JSONDecodeError:
                                                     logger.debug(f"Non-JSON text content: {content.text[:100]}")
                                                     items.append({"content": content.text, "path": query, "title": query})
                                             else:
                                                 items.append({"content": str(content), "path": query, "title": query})
                                         if items:
-                                            logger.info(f"Extracted {len(items)} items from {tool_name}")
+                                            logger.info(f"Extracted {len(items)} items from {tool_name} (filtered to user's repos)")
                                             return items
                                     return content_list if isinstance(content_list, list) else [content_list]
                             except Exception as e:

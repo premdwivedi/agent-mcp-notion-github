@@ -118,6 +118,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 NOTION_MCP_CMD = os.getenv("NOTION_MCP_CMD", "")
 GIT_MCP_CMD = os.getenv("GIT_MCP_CMD", "")  # GitHub MCP server command
 GITHUB_PERSONAL_ACCESS_TOKEN = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+GITHUB_REPO_FILTER = os.getenv("GITHUB_REPO_FILTER", "")  # Optional: Restrict to specific repo (format: "owner/repo" or just "repo")
 NOTION_ROOT_IDS = [v for v in os.getenv("NOTION_ROOT_IDS", "").split(",") if v]
 
 
