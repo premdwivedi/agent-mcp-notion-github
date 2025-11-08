@@ -143,3 +143,7 @@ frontend/
 - Verify `GITHUB_PERSONAL_ACCESS_TOKEN` is valid
 - Ensure token has `repo` scope
 - Check Docker socket is mounted (for Docker setup)
+
+## Workflow Diagram
+
+![alt text](workflow.png)
